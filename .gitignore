@@ -1,0 +1,6 @@
+venv/
+.env/
+.venv/
+pip-wheel-metadata/
+dist/
+build/
