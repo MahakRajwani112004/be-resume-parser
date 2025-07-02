@@ -1,5 +1,6 @@
 import json
 import numpy as np
+import os
 from fastapi import HTTPException
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
