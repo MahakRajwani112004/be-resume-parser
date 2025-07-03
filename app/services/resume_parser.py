@@ -1,149 +1,117 @@
+# app/services/resume_parser.py
+
 import os
 import json
 import re
 import logging
-import requests
 import numpy as np
 import asyncio
-from dotenv import load_dotenv
-from pypdf import PdfReader
 from app.config.config import settings
 from sentence_transformers import SentenceTransformer
 import openai
 
-load_dotenv()
+# --- Models can stay here as the central point of truth ---
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-
 openai_client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
-def extract_text_from_pdf(pdf_path):
-    try:
-        reader = PdfReader(pdf_path)
-        return "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-    except Exception as e:
-        logging.error(f"Error reading PDF {pdf_path}: {e}")
-        return ""
+# --- NEW: Define the intelligent prompt ---
+INTELLIGENT_PARSER_PROMPT = """
+You are an expert resume parser and data analyst. Your task is to convert the provided resume text into a single, valid JSON object following the enhanced schema below.
 
-def extract_json_blob(text):
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    return match.group(0) if match else text
+**Enhanced JSON Schema:**
+{
+  "name": "string",
+  "contact": {"email": "string", "phone": "string", "linkedin": "string"},
+  "summary": "string",
+  "total_experience_years": "float | null",
+  "skills": ["string"],
+  "projects": [{{"name": "string", "description": "string", "technologies": ["string"]}}],
+  "work_experience": [{
+    "job_title": "string",
+    "company": "string",
+    "duration": "string",
+    "experience_type": "string",
+    "calculated_duration_years": "float | null",
+    "responsibilities": ["string"],
+    
+  }],
+  "education": [{"degree": "string", "institution": "string", "year": "string"}]
+}
 
-def create_text_chunks(parsed_json, resume_filename):
-    chunks = []
-    name = parsed_json.get("name", "N/A")
-    summary = parsed_json.get("summary", "")
-    skills = ", ".join(parsed_json.get("skills", []))
-    exp_years = parsed_json.get("total_experience_years", "N/A")
-    chunks.append({
-        "resume_filename": resume_filename,
-        "chunk_type": "profile",
-        "text": f"Candidate Name: {name}. Summary: {summary}. Skills: {skills}. Experience: {exp_years} years.",
-        "candidate_name": name
-    })
-    for i, exp in enumerate(parsed_json.get("work_experience", [])):
-        text = f"Worked at {exp.get('company')} as {exp.get('job_title')}. {exp.get('duration')} - {' '.join(exp.get('responsibilities', []))}"
-        chunks.append({"resume_filename": resume_filename, "chunk_type": f"exp_{i}", "text": text, "candidate_name": name})
-    for i, proj in enumerate(parsed_json.get("projects", [])):
-        text = f"Project: {proj.get('name')}. Description: {proj.get('description')}. Tech: {', '.join(proj.get('technologies', []))}"
-        chunks.append({"resume_filename": resume_filename, "chunk_type": f"proj_{i}", "text": text, "candidate_name": name})
-    return chunks
+**CRITICAL INSTRUCTIONS:**
+1.  For `work_experience`: Analyze each role for its `experience_type` (must be one of: "full-time", "part-time", "internship", "freelance", "contract"). For `calculated_duration_years`, calculate the duration from the dates as a number (e.g., 2.5). Use `null` if unclear.
+2.  For `total_experience_years`: Sum the `calculated_duration_years` for ONLY "full-time" and "contract" roles.
 
-async def repair_json_with_gpt(bad_json_text):
-    system_prompt = "The following is a broken JSON. Fix it and return only valid JSON. No markdown, no explanation."
+Your entire response MUST be only the valid JSON object.
+"""
+
+# --- MODIFIED: This function now uses the intelligent prompt and adds logging ---
+async def parse_resume_from_text(raw_text: str):
+    """
+    Takes raw text and returns a richly structured JSON from the AI.
+    """
     try:
         response = await openai_client.chat.completions.create(
             model=settings.OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": bad_json_text}
-            ]
+                # Use the new, more powerful prompt
+                {"role": "system", "content": INTELLIGENT_PARSER_PROMPT}, 
+                {"role": "user", "content": f"Resume Text:\n{raw_text}"},
+            ],
+            response_format={"type": "json_object"}
         )
-        return json.loads(extract_json_blob(response.choices[0].message.content))
+        
+        parsed_json = json.loads(response.choices[0].message.content)
+        
+        # --- NEW: Log the parsed data so you can see it! ---
+        # We use json.dumps with an indent to "pretty-print" the JSON in your terminal.
+        candidate_name = parsed_json.get("name", "Unknown Candidate")
+        logging.info(f"--- Parsed Data for: {candidate_name} ---\n{json.dumps(parsed_json, indent=2)}\n-----------------------------------")
+        
+        return parsed_json
+        
     except Exception as e:
-        logging.error(f"Repair failed: {e}")
+        logging.error(f"AI parsing failed with intelligent prompt: {e}", exc_info=True)
         return None
 
-async def process_resume(pdf_path, semaphore):
-    async with semaphore:
-        filename = os.path.basename(pdf_path)
-        raw_text = extract_text_from_pdf(pdf_path)
-        if not raw_text.strip():
-            return []
+# --- MODIFIED: Update this function to use the new rich data ---
+def create_text_chunks(parsed_json, resume_filename):
+    """
+    Creates text chunks for embedding, now including the new experience details.
+    """
+    chunks = []
+    name = parsed_json.get("name", "N/A")
+    summary = parsed_json.get("summary", "")
+    skills = ", ".join(parsed_json.get("skills", []))
+    
+    # Use the new, more accurately calculated total experience
+    total_exp = parsed_json.get("total_experience_years", "N/A")
+    
+    chunks.append({
+        "resume_filename": resume_filename,
+        "chunk_type": "profile",
+        "text": f"Candidate Name: {name}. Summary: {summary}. Skills: {skills}. Calculated Relevant Experience: {total_exp} years.",
+        "candidate_name": name
+    })
+    
+    for i, exp in enumerate(parsed_json.get("work_experience", [])):
+        # Add the new fields to the chunk text to make them searchable!
+        exp_type = exp.get("experience_type", "N/A")
+        calc_dur = exp.get("calculated_duration_years", "N/A")
         
-        system_prompt = """You are a resume parser. Convert the text into valid JSON following this schema: {\n"name": "string", "contact": {"email": "string", "phone": "string", "linkedin": "string"},\n"summary": "string", "total_experience_years": "int", "skills": ["string"],\n"work_experience": [{"job_title": "string", "company": "string", "duration": "string", "responsibilities": ["string"]}],\n"projects": [{"name": "string", "description": "string", "technologies": ["string"]}],\n"education": [{"degree": "string", "institution": "string", "year": "string"}]\n}"""
-
-        try:
-            response = await openai_client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Resume Text:\n{raw_text}"},
-                ]
-            )
-            response_text = response.choices[0].message.content
-            try:
-                parsed = json.loads(extract_json_blob(response_text))
-            except json.JSONDecodeError:
-                parsed = await repair_json_with_gpt(response_text)
-            if parsed:
-                return create_text_chunks(parsed, filename)
-        except Exception as e:
-            logging.error(f"Error processing {filename}: {e}")
-        return []
-
-async def build_resume_database_async(load_from_cache=False):
-    PROCESSED_DATA_FILE = "processed_resume_data.json"
-    UPLOAD_URL_MAP_FILE = "resume_url_map.json"
-
-    if load_from_cache and os.path.exists(PROCESSED_DATA_FILE):
-        with open(PROCESSED_DATA_FILE, "r") as f:
-            data = json.load(f)
-        for item in data:
-            item["embedding"] = np.array(item["embedding"])
-        return data
-
-    try:
-        with open(UPLOAD_URL_MAP_FILE, "r") as f:
-            url_map = json.load(f)
-    except FileNotFoundError:
-        logging.error("resume_url_map.json not found.")
-        return []
-
-    temp_dir = "/tmp/resumes"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    pdf_paths = []
-    for filename, url in url_map.items():
-        temp_path = os.path.join(temp_dir, filename)
-        try:
-            response = requests.get(url)
-            with open(temp_path, "wb") as f:
-                f.write(response.content)
-            pdf_paths.append(temp_path)
-        except Exception as e:
-            logging.warning(f"Failed to download {url}: {e}")
-
-    if not pdf_paths:
-        logging.error("No resumes downloaded.")
-        return []
-
-    semaphore = asyncio.Semaphore(10)
-    tasks = [process_resume(pdf_path, semaphore) for pdf_path in pdf_paths]
-    results = await asyncio.gather(*tasks)
-
-    all_chunks = []
-    for chunk_list in results:
-        all_chunks.extend(chunk_list)
-
-    if not all_chunks:
-        logging.warning("No chunks extracted.")
-        return []
-
-    texts = [chunk["text"] for chunk in all_chunks]
-    embeddings = embedding_model.encode(texts, show_progress_bar=False)
-    db = [{"embedding": emb.tolist(), "metadata": chunk} for emb, chunk in zip(embeddings, all_chunks)]
-
-    with open(PROCESSED_DATA_FILE, "w") as f:
-        json.dump(db, f, indent=2)
-
-    return db
+        text = (f"Work Experience: {exp.get('job_title')} at {exp.get('company')}. "
+                f"Type: {exp_type}. Duration: {calc_dur} years. "
+                f"Responsibilities: {' '.join(exp.get('responsibilities', []))}")
+                
+        chunks.append({
+            "resume_filename": resume_filename, 
+            "chunk_type": f"exp_{i}", 
+            "text": text, 
+            "candidate_name": name
+        })
+        
+    for i, proj in enumerate(parsed_json.get("projects", [])):
+        text = f"Project: {proj.get('name')}. Description: {proj.get('description')}. Tech: {', '.join(proj.get('technologies', []))}"
+        chunks.append({"resume_filename": resume_filename, "chunk_type": f"proj_{i}", "text": text, "candidate_name": name})
+        
+    return chunks
