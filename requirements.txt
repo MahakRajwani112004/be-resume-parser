@@ -8,3 +8,4 @@ openai
 sentence-transformers
 scikit-learn
 numpy
+python-docx
