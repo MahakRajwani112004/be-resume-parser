@@ -4,15 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints import upload, search, status, resumes, jd_processor
 import logging
 
-
-
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-
-app = FastAPI()
+# ✅ Add root_path to match NGINX location block
+app = FastAPI(root_path="/fastapi")
 
 # CORS setup
 app.add_middleware(
@@ -22,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
+# Include routers under /api
 app.include_router(upload.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(status.router, prefix="/api")
